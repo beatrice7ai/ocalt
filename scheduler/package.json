@@ -1,0 +1,16 @@
+{
+  "name": "ocalt-scheduler",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/daemon.ts",
+    "start:bg": "tmux new-session -d -s ocalt-daemon 'bun run src/daemon.ts'",
+    "stop": "tmux kill-session -t ocalt 2>/dev/null; tmux kill-session -t ocalt-daemon 2>/dev/null; echo 'Stopped'",
+    "status": "bun run src/status.ts",
+    "trigger": "bun run src/trigger.ts",
+    "logs": "bun run src/logs.ts"
+  },
+  "dependencies": {
+    "cron": "^3.1.0"
+  }
+}

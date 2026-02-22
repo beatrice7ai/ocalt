@@ -1,0 +1,55 @@
+{
+  "telegram": {
+    "botToken": "",
+    "userId": ""
+  },
+  "jobs": [
+    {
+      "name": "heartbeat",
+      "schedule": "*/30 * * * *",
+      "mode": "continue",
+      "prompt": "Quick check: anything need attention? Check system health, recent notifications. If nothing, just say HEARTBEAT_OK.",
+      "telegram": true,
+      "suppressIfMatch": "HEARTBEAT_OK",
+      "interactive": false,
+      "timeout": 120
+    },
+    {
+      "name": "morning-briefing",
+      "schedule": "0 8 * * *",
+      "mode": "continue",
+      "prompt": "Good morning. Give me my daily briefing: weather, calendar, important emails, top priorities for today.",
+      "telegram": true,
+      "interactive": false,
+      "timeout": 180
+    },
+    {
+      "name": "evening-summary",
+      "schedule": "0 17 * * *",
+      "mode": "continue",
+      "prompt": "End of day summary: what did we accomplish today? What's pending? Anything I should prep for tomorrow?",
+      "telegram": true,
+      "interactive": false,
+      "timeout": 180
+    },
+    {
+      "name": "overnight-worker",
+      "schedule": "0 1 * * *",
+      "mode": "fresh",
+      "prompt": "Read the task list at ~/tasks/TODO.md. Pick the highest priority task marked 'ready'. Work on it. Write results to ~/tasks/completed/. Update TODO.md when done.",
+      "telegram": true,
+      "interactive": true,
+      "timeout": 1800,
+      "allowedTools": "Edit,Write,Bash,Read"
+    },
+    {
+      "name": "research",
+      "schedule": "0 3 * * 1",
+      "mode": "fresh",
+      "prompt": "Research the latest trends in AI agents this week. Write a summary to ~/research/weekly-ai-trends.md",
+      "telegram": true,
+      "interactive": false,
+      "timeout": 300
+    }
+  ]
+}

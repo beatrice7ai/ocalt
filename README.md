@@ -12,6 +12,16 @@ Three lightweight methods to connect Claude Code CLI to Telegram — from a full
 | 2 | [Raw Telegram Bot API](methods/raw-telegram-api/) | Low | Bash or Python, curl | Minimalists, quick & dirty, ~50 lines of code |
 | 3 | [n8n Webhook](methods/n8n-webhook/) | Low | n8n (Docker) | Non-coders, visual builder, zero code |
 
+## Scheduler
+
+The [OCALT Scheduler](scheduler/) runs Claude Code on cron-like schedules in **visible tmux windows** — you can literally watch Claude work.
+
+Two job modes:
+- **`continue`** — resumes the existing session (persistent memory, like heartbeats)
+- **`fresh`** — clean slate each run (isolated tasks, like overnight workers)
+
+Works alongside your own `claude` terminal — no conflicts. See [scheduler/README.md](scheduler/README.md).
+
 ## How They All Work
 
 Every method follows the same core loop:
