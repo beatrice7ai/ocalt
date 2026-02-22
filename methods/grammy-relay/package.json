@@ -1,0 +1,11 @@
+{
+  "name": "ocalt-grammy-relay",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "bun run relay.ts",
+    "dev": "bun --watch run relay.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.31.0"
+  }
+}
