@@ -11,6 +11,10 @@
     "categoryName": "ai-agents",
     "allowedUserIds": ["YOUR_DISCORD_USER_ID"]
   },
+  "interagent": {
+    "sharedDir": "~/agents/.shared",
+    "discordSharedChannels": ["handoff", "findings", "standup"]
+  },
   "agents": [
     {
       "name": "researcher",

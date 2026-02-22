@@ -25,6 +25,12 @@ import {
   getOrCreateChannels,
   type DiscordConfig,
 } from "./channels/discord.ts";
+import {
+  buildSharedContext,
+  postToDropFolder,
+  generateAgentInstructions,
+  type InteragentConfig,
+} from "./channels/interagent.ts";
 
 // --- Types ---
 interface Job {
@@ -53,6 +59,7 @@ interface Agent {
 interface Config {
   telegram?: TelegramConfig & { enabled?: boolean };
   discord?: DiscordConfig & { enabled?: boolean };
+  interagent?: InteragentConfig;
   agents: Agent[];
 }
 
@@ -121,12 +128,25 @@ function tmuxWindowExists(name: string): boolean {
 }
 
 // --- Agent workspace ---
-function ensureAgentWorkspace(agent: Agent) {
+function ensureAgentWorkspace(agent: Agent, config: Config, allAgents: Agent[]) {
   const workdir = expandPath(agent.workdir);
   mkdirSync(workdir, { recursive: true });
 
   const claudeMd = join(workdir, "CLAUDE.md");
   if (!existsSync(claudeMd)) {
+    const interagentInstructions = config.interagent
+      ? generateAgentInstructions(
+          config.interagent,
+          agent.name,
+          allAgents.map((a) => ({
+            name: a.name,
+            workdir: a.workdir,
+            allowedTools: a.allowedTools,
+            timeout: a.timeout,
+          }))
+        )
+      : "";
+
     writeFileSync(
       claudeMd,
       `# ${agent.name}\n\n${agent.description || "OCALT agent"}\n\n` +
@@ -134,7 +154,8 @@ function ensureAgentWorkspace(agent: Agent) {
         `## Instructions\n` +
         `You are the "${agent.name}" agent. You work in this directory.\n` +
         `Check your project files for context before starting any task.\n` +
-        `Write results, notes, and logs to files in this directory.\n`
+        `Write results, notes, and logs to files in this directory.\n` +
+        interagentInstructions
     );
     console.log(`   📝 Created CLAUDE.md for ${agent.name}`);
   }
@@ -163,8 +184,18 @@ async function runJob(
     `\n🚀 [${new Date().toLocaleTimeString()}] ${agent.name}/${job.name} (${job.mode})`
   );
 
+  // Build prompt — optionally inject shared context from other agents
+  let prompt = job.prompt;
+  if (config.interagent?.sharedDir) {
+    const sharedChannels = config.interagent.discordSharedChannels || ["handoff", "findings", "standup"];
+    const sharedContext = buildSharedContext(config.interagent, sharedChannels, 24);
+    if (sharedContext) {
+      prompt = `${prompt}\n\n---\n${sharedContext}`;
+    }
+  }
+
   // Build claude command
-  const args: string[] = ["-p", job.prompt];
+  const args: string[] = ["-p", prompt];
   if (job.mode === "continue") args.push("--continue");
   if (job.allowedTools || agent.allowedTools) {
     args.push("--allowedTools", job.allowedTools || agent.allowedTools!);
@@ -342,7 +373,7 @@ async function main() {
   for (const agent of config.agents) {
     console.log(`\n  📦 ${agent.name} — ${agent.description || ""}`);
     console.log(`     Workdir: ${agent.workdir}`);
-    ensureAgentWorkspace(agent);
+    ensureAgentWorkspace(agent, config, config.agents);
 
     for (const job of agent.jobs) {
       console.log(`     ├─ ${job.name} [${job.mode}] ${job.schedule}`);
