@@ -1,28 +1,22 @@
 #!/usr/bin/env bun
 /**
- * Manually trigger a job by name.
- * Usage: bun run trigger <job-name>
+ * Manually trigger a job.
+ * Usage: bun run trigger <agent-name>/<job-name>
+ *    or: bun run trigger <agent-name>   (lists that agent's jobs)
+ *    or: bun run trigger                (lists all)
  */
 
 import { readFileSync, existsSync } from "fs";
-import { join } from "path";
+import { execSync } from "child_process";
+import { join, resolve } from "path";
+import { homedir } from "os";
 
 const ROOT = import.meta.dir.replace("/src", "");
 const CONFIG_PATH = join(ROOT, "config.json");
 
-const jobName = process.argv[2];
-
-if (!jobName) {
-  console.log("Usage: bun run trigger <job-name>");
-  console.log("\nAvailable jobs:");
-
-  if (existsSync(CONFIG_PATH)) {
-    const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-    for (const job of config.jobs) {
-      console.log(`  ${job.name} (${job.mode}) — ${job.schedule}`);
-    }
-  }
-  process.exit(1);
+function expandPath(p: string): string {
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return resolve(p);
 }
 
 if (!existsSync(CONFIG_PATH)) {
@@ -31,44 +25,61 @@ if (!existsSync(CONFIG_PATH)) {
 }
 
 const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-const job = config.jobs.find((j: any) => j.name === jobName);
+const input = process.argv[2];
 
-if (!job) {
-  console.error(`❌ Job "${jobName}" not found.`);
+if (!input) {
+  console.log("Usage: bun run trigger <agent>/<job>\n\nAvailable:\n");
+  for (const agent of config.agents) {
+    for (const job of agent.jobs) {
+      console.log(`  ${agent.name}/${job.name}  [${job.mode}]  ${job.schedule}`);
+    }
+  }
+  process.exit(0);
+}
+
+const [agentName, jobName] = input.includes("/")
+  ? input.split("/", 2)
+  : [input, null];
+
+const agent = config.agents.find((a: any) => a.name === agentName);
+if (!agent) {
+  console.error(`❌ Agent "${agentName}" not found.`);
   process.exit(1);
 }
 
-// Dynamic import to reuse the runner
-const { runJob } = await import("./daemon.ts");
-
-console.log(`🔫 Triggering job: ${jobName}`);
-
-// We can't easily reuse runJob as it's embedded in main()
-// Instead, just build and exec the claude command directly
-import { execSync } from "child_process";
-
-const args: string[] = ["-p", job.prompt];
-if (job.mode === "continue") {
-  args.push("--continue");
-  if (job.sessionName) args.push("--resume", job.sessionName);
+if (!jobName) {
+  console.log(`Jobs for ${agentName}:\n`);
+  for (const job of agent.jobs) {
+    console.log(`  ${agentName}/${job.name}  [${job.mode}]  ${job.schedule}`);
+  }
+  process.exit(0);
 }
+
+const job = agent.jobs.find((j: any) => j.name === jobName);
+if (!job) {
+  console.error(`❌ Job "${jobName}" not found in agent "${agentName}".`);
+  process.exit(1);
+}
+
+const workdir = expandPath(agent.workdir);
+const args: string[] = ["-p", job.prompt];
+if (job.mode === "continue") args.push("--continue");
 if (job.allowedTools) args.push("--allowedTools", job.allowedTools);
 
-const cmd = `claude ${args.map((a: string) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")}`;
+const cmd = `cd '${workdir}' && claude ${args.map((a: string) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")}`;
 
-console.log(`Running: ${cmd.slice(0, 100)}...`);
-console.log("---");
+console.log(`🔫 Triggering: ${agentName}/${jobName} (${job.mode})`);
+console.log(`   Workdir: ${workdir}`);
+console.log("---\n");
 
 try {
-  const output = execSync(cmd, {
+  execSync(cmd, {
     encoding: "utf-8",
     timeout: (job.timeout || 120) * 1000,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: "inherit",
   });
-  console.log(output);
-  console.log("---");
-  console.log("✅ Done");
+  console.log("\n---\n✅ Done");
 } catch (err: any) {
-  console.error("❌ Error:", err.message);
+  console.error("\n❌ Error:", err.message);
   process.exit(1);
 }

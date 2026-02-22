@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Show scheduler status: jobs, schedules, last run times.
+ * Show multi-agent scheduler status.
  */
 
 import { readFileSync, existsSync } from "fs";
@@ -24,45 +24,49 @@ try {
 } catch {}
 
 console.log(`
-╔══════════════════════════════════════╗
-║       OCALT Scheduler Status        ║
-╚══════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║    OCALT Multi-Agent Scheduler Status   ║
+╚══════════════════════════════════════════╝
 `);
 
-// Check if tmux session is running
 let tmuxRunning = false;
 try {
   execSync(`tmux has-session -t ocalt 2>/dev/null`);
   tmuxRunning = true;
 } catch {}
 
-console.log(`Daemon: ${tmuxRunning ? "🟢 Running" : "🔴 Stopped"}`);
-console.log(`Telegram: ${config.telegram?.botToken ? "🟢 Configured" : "⚪ Not configured"}\n`);
+console.log(`Daemon:   ${tmuxRunning ? "🟢 Running" : "🔴 Stopped"}`);
+console.log(`Telegram: ${config.telegram?.botToken ? "🟢 Configured" : "⚪ Not set"}\n`);
 
-console.log("Jobs:\n");
+for (const agent of config.agents) {
+  console.log(`🤖 ${agent.name} — ${agent.description || ""}`);
+  console.log(`   Workdir: ${agent.workdir}\n`);
 
-for (const job of config.jobs) {
-  const s = state[job.name];
-  const statusEmoji = s?.lastStatus === "ok" ? "✅" :
-                      s?.lastStatus === "error" ? "❌" :
-                      s?.lastStatus === "timeout" ? "⏰" :
-                      s?.lastStatus === "suppressed" ? "⏭️" : "⚪";
+  for (const job of agent.jobs) {
+    const stateKey = `${agent.name}/${job.name}`;
+    const s = state[stateKey];
+    const emoji =
+      s?.lastStatus === "ok" ? "✅" :
+      s?.lastStatus === "error" ? "❌" :
+      s?.lastStatus === "timeout" ? "⏰" :
+      s?.lastStatus === "suppressed" ? "⏭️" : "⚪";
 
-  console.log(`  ${job.name}`);
-  console.log(`    Schedule:   ${job.schedule}`);
-  console.log(`    Mode:       ${job.mode}`);
-  console.log(`    Telegram:   ${job.telegram ? "yes" : "no"}`);
-  console.log(`    Last run:   ${s?.lastRun ? new Date(s.lastRun).toLocaleString() : "never"}`);
-  console.log(`    Last status: ${statusEmoji} ${s?.lastStatus || "never run"}`);
-  console.log(`    Duration:   ${s?.lastDuration ? s.lastDuration.toFixed(1) + "s" : "-"}`);
-  console.log(`    Total runs: ${s?.runCount || 0}`);
+    console.log(`   ${emoji} ${job.name} [${job.mode}]`);
+    console.log(`      Schedule:  ${job.schedule}`);
+    console.log(`      Last run:  ${s?.lastRun ? new Date(s.lastRun).toLocaleString() : "never"}`);
+    console.log(`      Duration:  ${s?.lastDuration ? s.lastDuration.toFixed(1) + "s" : "-"}`);
+    console.log(`      Runs:      ${s?.runCount || 0}`);
+  }
   console.log();
 }
 
 if (tmuxRunning) {
-  console.log(`\n👀 Watch: tmux attach -t ocalt`);
+  console.log(`👀 Watch: tmux attach -t ocalt`);
   try {
-    const windows = execSync(`tmux list-windows -t ocalt -F '#W' 2>/dev/null`, { encoding: "utf-8" }).trim();
-    console.log(`Active windows: ${windows.split("\n").join(", ")}`);
+    const windows = execSync(
+      `tmux list-windows -t ocalt -F '#I:#W' 2>/dev/null`,
+      { encoding: "utf-8" }
+    ).trim();
+    console.log(`Windows: ${windows.split("\n").join(", ")}`);
   } catch {}
 }

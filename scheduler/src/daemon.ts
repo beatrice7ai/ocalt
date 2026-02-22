@@ -1,15 +1,23 @@
 #!/usr/bin/env bun
 /**
- * OCALT Scheduler Daemon
+ * OCALT Scheduler Daemon — Multi-Agent Edition
  *
- * Runs Claude Code CLI on cron schedules in visible tmux windows.
- * Two modes: "continue" (persistent session) and "fresh" (isolated).
+ * Runs multiple Claude Code agents on cron schedules.
+ * Each agent has its own:
+ *   - Working directory (project context)
+ *   - Session history (--continue resumes per-agent)
+ *   - tmux window (watch it work)
+ *
+ * Two modes per job:
+ *   - "continue" — resumes the agent's session (persistent memory, self-compacting)
+ *   - "fresh"    — clean slate (isolated task)
  */
 
 import { CronJob } from "cron";
-import { spawn, execSync } from "child_process";
-import { readFileSync, mkdirSync, appendFileSync, existsSync, writeFileSync } from "fs";
-import { join } from "path";
+import { execSync } from "child_process";
+import { readFileSync, mkdirSync, existsSync, writeFileSync } from "fs";
+import { join, resolve } from "path";
+import { homedir } from "os";
 
 // --- Types ---
 interface TelegramConfig {
@@ -22,7 +30,6 @@ interface Job {
   schedule: string;
   mode: "continue" | "fresh";
   prompt: string;
-  sessionName?: string;
   telegram?: boolean;
   suppressIfMatch?: string;
   interactive?: boolean;
@@ -30,9 +37,17 @@ interface Job {
   allowedTools?: string;
 }
 
+interface Agent {
+  name: string;
+  description?: string;
+  workdir: string;
+  claudeProfile?: string;
+  jobs: Job[];
+}
+
 interface Config {
   telegram?: TelegramConfig;
-  jobs: Job[];
+  agents: Agent[];
 }
 
 // --- Paths ---
@@ -40,6 +55,7 @@ const ROOT = import.meta.dir.replace("/src", "");
 const CONFIG_PATH = join(ROOT, "config.json");
 const LOGS_DIR = join(ROOT, "logs");
 const STATE_FILE = join(ROOT, ".state.json");
+const SESSION_DIR = join(ROOT, ".sessions");
 const TMUX_SESSION = "ocalt";
 
 // --- State tracking ---
@@ -48,6 +64,7 @@ interface JobState {
   lastStatus?: "ok" | "error" | "timeout" | "suppressed";
   lastDuration?: number;
   runCount: number;
+  sessionId?: string;
 }
 
 function loadState(): Record<string, JobState> {
@@ -60,6 +77,12 @@ function loadState(): Record<string, JobState> {
 
 function saveState(state: Record<string, JobState>) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// --- Resolve ~ in paths ---
+function expandPath(p: string): string {
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return resolve(p);
 }
 
 // --- Config ---
@@ -94,8 +117,7 @@ function ensureTmuxSession() {
   try {
     execSync(`tmux has-session -t ${TMUX_SESSION} 2>/dev/null`);
   } catch {
-    // Create session with a placeholder window
-    execSync(`tmux new-session -d -s ${TMUX_SESSION} -n scheduler`);
+    execSync(`tmux new-session -d -s ${TMUX_SESSION} -n dashboard`);
     console.log(`📺 Created tmux session: ${TMUX_SESSION}`);
     console.log(`   Attach with: tmux attach -t ${TMUX_SESSION}`);
   }
@@ -103,79 +125,129 @@ function ensureTmuxSession() {
 
 function tmuxWindowExists(name: string): boolean {
   try {
-    execSync(`tmux list-windows -t ${TMUX_SESSION} -F '#W' 2>/dev/null | grep -q '^${name}$'`);
-    return true;
+    const windows = execSync(
+      `tmux list-windows -t ${TMUX_SESSION} -F '#W' 2>/dev/null`,
+      { encoding: "utf-8" }
+    );
+    return windows.split("\n").includes(name);
   } catch {
     return false;
   }
 }
 
+// --- Agent workspace setup ---
+function ensureAgentWorkspace(agent: Agent) {
+  const workdir = expandPath(agent.workdir);
+  mkdirSync(workdir, { recursive: true });
+
+  // Create a CLAUDE.md for the agent if it doesn't exist
+  const claudeMd = join(workdir, "CLAUDE.md");
+  if (!existsSync(claudeMd)) {
+    writeFileSync(
+      claudeMd,
+      `# ${agent.name}\n\n${agent.description || "OCALT agent"}\n\n` +
+      `## Working Directory\n${workdir}\n\n` +
+      `## Instructions\n` +
+      `You are the "${agent.name}" agent. You work in this directory.\n` +
+      `Check your project files for context before starting any task.\n` +
+      `Write results, notes, and logs to files in this directory.\n`
+    );
+    console.log(`   📝 Created CLAUDE.md for ${agent.name}`);
+  }
+}
+
+// --- Session ID management ---
+// Each agent's "continue" jobs share a session. Fresh jobs don't.
+function getSessionFile(agentName: string): string {
+  mkdirSync(SESSION_DIR, { recursive: true });
+  return join(SESSION_DIR, `${agentName}.session`);
+}
+
+function getSessionId(agentName: string): string | null {
+  const file = getSessionFile(agentName);
+  try {
+    return readFileSync(file, "utf-8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSessionId(agentName: string, sessionId: string) {
+  writeFileSync(getSessionFile(agentName), sessionId);
+}
+
 // --- Job runner ---
-async function runJob(job: Job, config: Config): Promise<void> {
+async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
+  const stateKey = `${agent.name}/${job.name}`;
   const state = loadState();
-  const jobState: JobState = state[job.name] || { runCount: 0 };
+  const jobState: JobState = state[stateKey] || { runCount: 0 };
   const startTime = Date.now();
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const logFile = join(LOGS_DIR, `${job.name}-${timestamp}.log`);
+  const logFile = join(LOGS_DIR, `${agent.name}-${job.name}-${timestamp}.log`);
+  const windowName = `${agent.name}-${job.name}`;
+  const workdir = expandPath(agent.workdir);
 
-  console.log(`\n🚀 [${new Date().toLocaleTimeString()}] Running job: ${job.name} (${job.mode})`);
+  console.log(
+    `\n🚀 [${new Date().toLocaleTimeString()}] ${agent.name}/${job.name} (${job.mode})`
+  );
 
   // Build claude command
   const args: string[] = ["-p", job.prompt];
 
   if (job.mode === "continue") {
+    // Use --continue to resume the agent's ongoing session
     args.push("--continue");
-    if (job.sessionName) {
-      args.push("--resume", job.sessionName);
-    }
   }
 
   if (job.allowedTools) {
     args.push("--allowedTools", job.allowedTools);
   }
 
-  // Build the full command string for tmux
+  // Build command — cd to agent workdir first
   const claudeCmd = `claude ${args.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")}`;
-  const fullCmd = job.interactive
-    ? `${claudeCmd} 2>&1 | tee '${logFile}'`
-    : `${claudeCmd} 2>&1 | tee '${logFile}'; echo "--- JOB COMPLETE ---"`;
+  const fullCmd = [
+    `cd '${workdir}'`,
+    `echo "=== ${agent.name}/${job.name} [${job.mode}] $(date) ===" | tee '${logFile}'`,
+    `${claudeCmd} 2>&1 | tee -a '${logFile}'`,
+    job.interactive ? "" : `echo "--- JOB COMPLETE ---" | tee -a '${logFile}'`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
 
   // Ensure tmux session exists
   ensureTmuxSession();
 
-  // Create or reuse tmux window
-  if (tmuxWindowExists(job.name)) {
-    // Send command to existing window
-    execSync(`tmux send-keys -t ${TMUX_SESSION}:${job.name} '${fullCmd.replace(/'/g, "'\\''")}' Enter`);
+  // Run in tmux window
+  if (tmuxWindowExists(windowName)) {
+    execSync(
+      `tmux send-keys -t ${TMUX_SESSION}:${windowName} '${fullCmd.replace(/'/g, "'\\''")}' Enter`
+    );
   } else {
-    // Create new window with the command
-    execSync(`tmux new-window -t ${TMUX_SESSION} -n ${job.name} '${fullCmd.replace(/'/g, "'\\''")}'`);
+    execSync(
+      `tmux new-window -t ${TMUX_SESSION} -n ${windowName} "bash -c \\"${fullCmd.replace(/"/g, '\\\\\\"')}; ${job.interactive ? 'bash' : 'sleep 2'}\\""` 
+    );
   }
 
-  // Wait for completion by watching the log file
+  // Wait for completion
   return new Promise<void>((resolve) => {
     const timeoutMs = (job.timeout || 120) * 1000;
     let elapsed = 0;
-    const pollInterval = 2000;
+    const pollInterval = 3000;
 
     const poll = setInterval(() => {
       elapsed += pollInterval;
 
-      // Check if log file has completion marker or process finished
       let logContent = "";
       try {
         logContent = readFileSync(logFile, "utf-8");
-      } catch {
-        // File not created yet
-      }
+      } catch {}
 
-      const isComplete = logContent.includes("--- JOB COMPLETE ---") || elapsed >= timeoutMs;
+      const isComplete =
+        logContent.includes("--- JOB COMPLETE ---") || elapsed >= timeoutMs;
 
       if (isComplete) {
         clearInterval(poll);
         const duration = (Date.now() - startTime) / 1000;
-
-        // Clean up the completion marker
         const output = logContent.replace("--- JOB COMPLETE ---", "").trim();
 
         // Check suppression
@@ -183,40 +255,43 @@ async function runJob(job: Job, config: Config): Promise<void> {
           job.suppressIfMatch && output.includes(job.suppressIfMatch);
 
         if (shouldSuppress) {
-          console.log(`   ⏭️  Suppressed (matched: ${job.suppressIfMatch}) [${duration.toFixed(1)}s]`);
+          console.log(
+            `   ⏭️  ${agent.name}/${job.name} suppressed [${duration.toFixed(1)}s]`
+          );
           jobState.lastStatus = "suppressed";
         } else if (elapsed >= timeoutMs) {
-          console.log(`   ⏰ Timed out after ${job.timeout}s`);
+          console.log(`   ⏰ ${agent.name}/${job.name} timed out`);
           jobState.lastStatus = "timeout";
-
           if (job.telegram && config.telegram?.botToken) {
-            sendTelegram(config.telegram, `⏰ *${job.name}* timed out after ${job.timeout}s`);
+            sendTelegram(
+              config.telegram,
+              `⏰ *${agent.name}/${job.name}* timed out after ${job.timeout}s`
+            );
           }
         } else {
-          console.log(`   ✅ Complete [${duration.toFixed(1)}s, ${output.length} chars]`);
+          console.log(
+            `   ✅ ${agent.name}/${job.name} [${duration.toFixed(1)}s, ${output.length} chars]`
+          );
           jobState.lastStatus = "ok";
-
-          // Send to Telegram if configured
           if (job.telegram && config.telegram?.botToken && output) {
-            const prefix = `📋 *${job.name}*\n\n`;
+            const prefix = `🤖 *${agent.name}* — _${job.name}_\n\n`;
             sendTelegram(config.telegram, prefix + output);
           }
         }
 
-        // Update state
         jobState.lastRun = new Date().toISOString();
         jobState.lastDuration = duration;
         jobState.runCount++;
-        state[job.name] = jobState;
+        state[stateKey] = jobState;
         saveState(state);
 
         // Close window if not interactive
         if (!job.interactive) {
           try {
-            execSync(`tmux kill-window -t ${TMUX_SESSION}:${job.name} 2>/dev/null`);
-          } catch {
-            // Window may already be gone
-          }
+            execSync(
+              `tmux kill-window -t ${TMUX_SESSION}:${windowName} 2>/dev/null`
+            );
+          } catch {}
         }
 
         resolve();
@@ -228,43 +303,51 @@ async function runJob(job: Job, config: Config): Promise<void> {
 // --- Main ---
 async function main() {
   const config = loadConfig();
-
-  // Ensure logs directory
   mkdirSync(LOGS_DIR, { recursive: true });
 
+  const totalJobs = config.agents.reduce((n, a) => n + a.jobs.length, 0);
+
   console.log(`
-╔══════════════════════════════════════╗
-║       OCALT Scheduler v1.0          ║
-║   Claude Code on a Schedule         ║
-╚══════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║    OCALT Multi-Agent Scheduler v2.0     ║
+║    Claude Code Agents on a Schedule     ║
+╚══════════════════════════════════════════╝
 `);
 
-  console.log(`📅 ${config.jobs.length} jobs configured:\n`);
+  console.log(`🤖 ${config.agents.length} agents, ${totalJobs} jobs\n`);
 
-  // Register cron jobs
   const cronJobs: CronJob[] = [];
 
-  for (const job of config.jobs) {
-    console.log(`   ${job.name}`);
-    console.log(`     Schedule: ${job.schedule}`);
-    console.log(`     Mode:     ${job.mode}`);
-    console.log(`     Prompt:   ${job.prompt.slice(0, 60)}...`);
-    console.log();
+  for (const agent of config.agents) {
+    console.log(`  📦 ${agent.name} — ${agent.description || ""}`);
+    console.log(`     Workdir: ${agent.workdir}`);
 
-    const cronJob = new CronJob(job.schedule, () => runJob(job, config), null, true);
-    cronJobs.push(cronJob);
+    // Ensure workspace exists
+    ensureAgentWorkspace(agent);
+
+    for (const job of agent.jobs) {
+      console.log(`     ├─ ${job.name} [${job.mode}] ${job.schedule}`);
+
+      const cronJob = new CronJob(
+        job.schedule,
+        () => runJob(agent, job, config),
+        null,
+        true
+      );
+      cronJobs.push(cronJob);
+    }
+    console.log();
   }
 
-  // Ensure tmux session exists
   ensureTmuxSession();
 
-  console.log(`\n👀 Watch jobs run: tmux attach -t ${TMUX_SESSION}`);
-  console.log(`🛑 Stop: Ctrl+C or bun run stop\n`);
+  console.log(`👀 Watch: tmux attach -t ${TMUX_SESSION}`);
+  console.log(`   Switch windows: Ctrl-B + n/p`);
+  console.log(`   Each agent/job gets its own window\n`);
   console.log(`⏳ Waiting for next scheduled job...\n`);
 
-  // Keep alive
   process.on("SIGINT", () => {
-    console.log("\n🛑 Shutting down scheduler...");
+    console.log("\n🛑 Shutting down...");
     cronJobs.forEach((j) => j.stop());
     process.exit(0);
   });
@@ -274,10 +357,8 @@ async function main() {
     process.exit(0);
   });
 
-  // Heartbeat log
-  setInterval(() => {
-    // Silent keepalive
-  }, 60_000);
+  // Keepalive
+  setInterval(() => {}, 60_000);
 }
 
 main().catch(console.error);
