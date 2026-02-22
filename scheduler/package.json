@@ -11,6 +11,7 @@
     "logs": "bun run src/logs.ts"
   },
   "dependencies": {
-    "cron": "^3.1.0"
+    "cron": "^3.1.0",
+    "discord.js": "^14.16.0"
   }
 }
