@@ -1,16 +1,12 @@
 #!/usr/bin/env bun
 /**
- * OCALT Scheduler Daemon — Multi-Agent Edition
+ * OCALT Multi-Agent Scheduler Daemon
  *
- * Runs multiple Claude Code agents on cron schedules.
- * Each agent has its own:
- *   - Working directory (project context)
- *   - Session history (--continue resumes per-agent)
- *   - tmux window (watch it work)
- *
- * Two modes per job:
- *   - "continue" — resumes the agent's session (persistent memory, self-compacting)
- *   - "fresh"    — clean slate (isolated task)
+ * - Multiple Claude Code agents, each with own workdir + session
+ * - Cron-scheduled jobs (continue or fresh mode)
+ * - Visible in tmux windows (watch agents work)
+ * - Telegram: reply to agent messages or @agent prefix
+ * - Discord: each agent gets its own channel
  */
 
 import { CronJob } from "cron";
@@ -18,19 +14,26 @@ import { execSync } from "child_process";
 import { readFileSync, mkdirSync, existsSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
+import {
+  sendAgentMessage as sendTelegramMessage,
+  startTelegramListener,
+  type TelegramConfig,
+} from "./channels/telegram.ts";
+import {
+  sendAgentMessage as sendDiscordMessage,
+  startDiscordListener,
+  getOrCreateChannels,
+  type DiscordConfig,
+} from "./channels/discord.ts";
 
 // --- Types ---
-interface TelegramConfig {
-  botToken: string;
-  userId: string;
-}
-
 interface Job {
   name: string;
   schedule: string;
   mode: "continue" | "fresh";
   prompt: string;
   telegram?: boolean;
+  discord?: boolean;
   suppressIfMatch?: string;
   interactive?: boolean;
   timeout?: number;
@@ -43,10 +46,13 @@ interface Agent {
   workdir: string;
   claudeProfile?: string;
   jobs: Job[];
+  allowedTools?: string;
+  timeout?: number;
 }
 
 interface Config {
-  telegram?: TelegramConfig;
+  telegram?: TelegramConfig & { enabled?: boolean };
+  discord?: DiscordConfig & { enabled?: boolean };
   agents: Agent[];
 }
 
@@ -55,16 +61,14 @@ const ROOT = import.meta.dir.replace("/src", "");
 const CONFIG_PATH = join(ROOT, "config.json");
 const LOGS_DIR = join(ROOT, "logs");
 const STATE_FILE = join(ROOT, ".state.json");
-const SESSION_DIR = join(ROOT, ".sessions");
 const TMUX_SESSION = "ocalt";
 
-// --- State tracking ---
+// --- State ---
 interface JobState {
   lastRun?: string;
   lastStatus?: "ok" | "error" | "timeout" | "suppressed";
   lastDuration?: number;
   runCount: number;
-  sessionId?: string;
 }
 
 function loadState(): Record<string, JobState> {
@@ -79,47 +83,28 @@ function saveState(state: Record<string, JobState>) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// --- Resolve ~ in paths ---
 function expandPath(p: string): string {
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
   return resolve(p);
 }
 
-// --- Config ---
 function loadConfig(): Config {
   if (!existsSync(CONFIG_PATH)) {
-    console.error(`❌ No config.json found. Copy config.example.json to config.json and edit it.`);
+    console.error(
+      `❌ No config.json found. Copy config.example.json to config.json and edit it.`
+    );
     process.exit(1);
   }
   return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 }
 
-// --- Telegram ---
-async function sendTelegram(config: TelegramConfig, text: string) {
-  const url = `https://api.telegram.org/bot${config.botToken}/sendMessage`;
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: config.userId,
-        text: text.slice(0, 4096),
-        parse_mode: "Markdown",
-      }),
-    });
-  } catch (err) {
-    console.error(`Telegram send error:`, err);
-  }
-}
-
-// --- tmux helpers ---
+// --- tmux ---
 function ensureTmuxSession() {
   try {
     execSync(`tmux has-session -t ${TMUX_SESSION} 2>/dev/null`);
   } catch {
     execSync(`tmux new-session -d -s ${TMUX_SESSION} -n dashboard`);
     console.log(`📺 Created tmux session: ${TMUX_SESSION}`);
-    console.log(`   Attach with: tmux attach -t ${TMUX_SESSION}`);
   }
 }
 
@@ -135,54 +120,41 @@ function tmuxWindowExists(name: string): boolean {
   }
 }
 
-// --- Agent workspace setup ---
+// --- Agent workspace ---
 function ensureAgentWorkspace(agent: Agent) {
   const workdir = expandPath(agent.workdir);
   mkdirSync(workdir, { recursive: true });
 
-  // Create a CLAUDE.md for the agent if it doesn't exist
   const claudeMd = join(workdir, "CLAUDE.md");
   if (!existsSync(claudeMd)) {
     writeFileSync(
       claudeMd,
       `# ${agent.name}\n\n${agent.description || "OCALT agent"}\n\n` +
-      `## Working Directory\n${workdir}\n\n` +
-      `## Instructions\n` +
-      `You are the "${agent.name}" agent. You work in this directory.\n` +
-      `Check your project files for context before starting any task.\n` +
-      `Write results, notes, and logs to files in this directory.\n`
+        `## Working Directory\n${workdir}\n\n` +
+        `## Instructions\n` +
+        `You are the "${agent.name}" agent. You work in this directory.\n` +
+        `Check your project files for context before starting any task.\n` +
+        `Write results, notes, and logs to files in this directory.\n`
     );
     console.log(`   📝 Created CLAUDE.md for ${agent.name}`);
   }
 }
 
-// --- Session ID management ---
-// Each agent's "continue" jobs share a session. Fresh jobs don't.
-function getSessionFile(agentName: string): string {
-  mkdirSync(SESSION_DIR, { recursive: true });
-  return join(SESSION_DIR, `${agentName}.session`);
-}
-
-function getSessionId(agentName: string): string | null {
-  const file = getSessionFile(agentName);
-  try {
-    return readFileSync(file, "utf-8").trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-function saveSessionId(agentName: string, sessionId: string) {
-  writeFileSync(getSessionFile(agentName), sessionId);
-}
-
 // --- Job runner ---
-async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
+async function runJob(
+  agent: Agent,
+  job: Job,
+  config: Config,
+  discordChannelMap?: Record<string, string>
+): Promise<void> {
   const stateKey = `${agent.name}/${job.name}`;
   const state = loadState();
   const jobState: JobState = state[stateKey] || { runCount: 0 };
   const startTime = Date.now();
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")
+    .slice(0, 19);
   const logFile = join(LOGS_DIR, `${agent.name}-${job.name}-${timestamp}.log`);
   const windowName = `${agent.name}-${job.name}`;
   const workdir = expandPath(agent.workdir);
@@ -193,18 +165,14 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
 
   // Build claude command
   const args: string[] = ["-p", job.prompt];
-
-  if (job.mode === "continue") {
-    // Use --continue to resume the agent's ongoing session
-    args.push("--continue");
+  if (job.mode === "continue") args.push("--continue");
+  if (job.allowedTools || agent.allowedTools) {
+    args.push("--allowedTools", job.allowedTools || agent.allowedTools!);
   }
 
-  if (job.allowedTools) {
-    args.push("--allowedTools", job.allowedTools);
-  }
-
-  // Build command — cd to agent workdir first
-  const claudeCmd = `claude ${args.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")}`;
+  const claudeCmd = `claude ${args
+    .map((a) => `'${a.replace(/'/g, "'\\''")}'`)
+    .join(" ")}`;
   const fullCmd = [
     `cd '${workdir}'`,
     `echo "=== ${agent.name}/${job.name} [${job.mode}] $(date) ===" | tee '${logFile}'`,
@@ -214,27 +182,31 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
     .filter(Boolean)
     .join(" && ");
 
-  // Ensure tmux session exists
   ensureTmuxSession();
 
-  // Run in tmux window
   if (tmuxWindowExists(windowName)) {
     execSync(
-      `tmux send-keys -t ${TMUX_SESSION}:${windowName} '${fullCmd.replace(/'/g, "'\\''")}' Enter`
+      `tmux send-keys -t ${TMUX_SESSION}:${windowName} '${fullCmd.replace(
+        /'/g,
+        "'\\''"
+      )}' Enter`
     );
   } else {
     execSync(
-      `tmux new-window -t ${TMUX_SESSION} -n ${windowName} "bash -c \\"${fullCmd.replace(/"/g, '\\\\\\"')}; ${job.interactive ? 'bash' : 'sleep 2'}\\""` 
+      `tmux new-window -t ${TMUX_SESSION} -n ${windowName} "bash -c \\"${fullCmd.replace(
+        /"/g,
+        '\\\\\\"'
+      )}; ${job.interactive ? "bash" : "sleep 2"}\\""` 
     );
   }
 
   // Wait for completion
   return new Promise<void>((resolve) => {
-    const timeoutMs = (job.timeout || 120) * 1000;
+    const timeoutMs = (job.timeout || agent.timeout || 120) * 1000;
     let elapsed = 0;
     const pollInterval = 3000;
 
-    const poll = setInterval(() => {
+    const poll = setInterval(async () => {
       elapsed += pollInterval;
 
       let logContent = "";
@@ -250,7 +222,6 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
         const duration = (Date.now() - startTime) / 1000;
         const output = logContent.replace("--- JOB COMPLETE ---", "").trim();
 
-        // Check suppression
         const shouldSuppress =
           job.suppressIfMatch && output.includes(job.suppressIfMatch);
 
@@ -262,10 +233,14 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
         } else if (elapsed >= timeoutMs) {
           console.log(`   ⏰ ${agent.name}/${job.name} timed out`);
           jobState.lastStatus = "timeout";
-          if (job.telegram && config.telegram?.botToken) {
-            sendTelegram(
+
+          // Notify on timeout
+          if (job.telegram !== false && config.telegram?.enabled && config.telegram.botToken) {
+            await sendTelegramMessage(
               config.telegram,
-              `⏰ *${agent.name}/${job.name}* timed out after ${job.timeout}s`
+              agent.name,
+              job.name,
+              `⏰ Timed out after ${job.timeout || agent.timeout || 120}s`
             );
           }
         } else {
@@ -273,9 +248,26 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
             `   ✅ ${agent.name}/${job.name} [${duration.toFixed(1)}s, ${output.length} chars]`
           );
           jobState.lastStatus = "ok";
-          if (job.telegram && config.telegram?.botToken && output) {
-            const prefix = `🤖 *${agent.name}* — _${job.name}_\n\n`;
-            sendTelegram(config.telegram, prefix + output);
+
+          // Send to Telegram
+          if (job.telegram !== false && config.telegram?.enabled && config.telegram.botToken && output) {
+            await sendTelegramMessage(
+              config.telegram,
+              agent.name,
+              job.name,
+              output
+            );
+          }
+
+          // Send to Discord
+          if (job.discord !== false && config.discord?.enabled && config.discord.botToken && discordChannelMap && output) {
+            await sendDiscordMessage(
+              config.discord,
+              discordChannelMap,
+              agent.name,
+              job.name,
+              output
+            );
           }
         }
 
@@ -285,7 +277,6 @@ async function runJob(agent: Agent, job: Job, config: Config): Promise<void> {
         state[stateKey] = jobState;
         saveState(state);
 
-        // Close window if not interactive
         if (!job.interactive) {
           try {
             execSync(
@@ -308,21 +299,49 @@ async function main() {
   const totalJobs = config.agents.reduce((n, a) => n + a.jobs.length, 0);
 
   console.log(`
-╔══════════════════════════════════════════╗
-║    OCALT Multi-Agent Scheduler v2.0     ║
-║    Claude Code Agents on a Schedule     ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║     OCALT Multi-Agent Scheduler v3.0        ║
+║     Claude Code Agents · Telegram · Discord ║
+╚══════════════════════════════════════════════╝
 `);
 
-  console.log(`🤖 ${config.agents.length} agents, ${totalJobs} jobs\n`);
+  // --- Channel status ---
+  const telegramEnabled = config.telegram?.enabled && config.telegram?.botToken;
+  const discordEnabled = config.discord?.enabled && config.discord?.botToken;
 
+  console.log(`📱 Telegram: ${telegramEnabled ? "🟢 Enabled" : "⚪ Disabled"}`);
+  console.log(`🎮 Discord:  ${discordEnabled ? "🟢 Enabled" : "⚪ Disabled"}`);
+  console.log(`🤖 Agents:   ${config.agents.length}`);
+  console.log(`📅 Jobs:     ${totalJobs}\n`);
+
+  // --- Setup Discord channels ---
+  let discordChannelMap: Record<string, string> | undefined;
+  if (discordEnabled) {
+    try {
+      const agentInfos = config.agents.map((a) => ({
+        name: a.name,
+        workdir: a.workdir,
+        description: a.description,
+        allowedTools: a.allowedTools,
+        timeout: a.timeout,
+      }));
+      discordChannelMap = await getOrCreateChannels(config.discord!, agentInfos);
+      console.log(
+        `🎮 Discord channels: ${Object.entries(discordChannelMap)
+          .map(([a]) => `#${a}`)
+          .join(", ")}`
+      );
+    } catch (err) {
+      console.error("Discord setup error:", err);
+    }
+  }
+
+  // --- Register cron jobs ---
   const cronJobs: CronJob[] = [];
 
   for (const agent of config.agents) {
-    console.log(`  📦 ${agent.name} — ${agent.description || ""}`);
+    console.log(`\n  📦 ${agent.name} — ${agent.description || ""}`);
     console.log(`     Workdir: ${agent.workdir}`);
-
-    // Ensure workspace exists
     ensureAgentWorkspace(agent);
 
     for (const job of agent.jobs) {
@@ -330,20 +349,39 @@ async function main() {
 
       const cronJob = new CronJob(
         job.schedule,
-        () => runJob(agent, job, config),
+        () => runJob(agent, job, config, discordChannelMap),
         null,
         true
       );
       cronJobs.push(cronJob);
     }
-    console.log();
   }
 
   ensureTmuxSession();
 
-  console.log(`👀 Watch: tmux attach -t ${TMUX_SESSION}`);
-  console.log(`   Switch windows: Ctrl-B + n/p`);
-  console.log(`   Each agent/job gets its own window\n`);
+  // --- Start channel listeners ---
+  const agentInfos = config.agents.map((a) => ({
+    name: a.name,
+    workdir: a.workdir,
+    description: a.description,
+    allowedTools: a.allowedTools,
+    timeout: a.timeout,
+  }));
+
+  if (telegramEnabled) {
+    // Run listener in background (non-blocking)
+    startTelegramListener(config.telegram!, agentInfos).catch((err) =>
+      console.error("Telegram listener error:", err)
+    );
+  }
+
+  if (discordEnabled) {
+    startDiscordListener(config.discord!, agentInfos).catch((err) =>
+      console.error("Discord listener error:", err)
+    );
+  }
+
+  console.log(`\n👀 Watch: tmux attach -t ${TMUX_SESSION}`);
   console.log(`⏳ Waiting for next scheduled job...\n`);
 
   process.on("SIGINT", () => {
@@ -357,8 +395,10 @@ async function main() {
     process.exit(0);
   });
 
-  // Keepalive
   setInterval(() => {}, 60_000);
 }
 
 main().catch(console.error);
+
+// Export for trigger.ts
+export { runJob };

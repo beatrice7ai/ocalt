@@ -1,21 +1,28 @@
 {
   "telegram": {
-    "botToken": "",
-    "userId": ""
+    "enabled": true,
+    "botToken": "YOUR_BOT_TOKEN",
+    "userId": "YOUR_USER_ID"
+  },
+  "discord": {
+    "enabled": false,
+    "botToken": "YOUR_DISCORD_BOT_TOKEN",
+    "guildId": "YOUR_SERVER_ID",
+    "categoryName": "ai-agents",
+    "allowedUserIds": ["YOUR_DISCORD_USER_ID"]
   },
   "agents": [
     {
       "name": "researcher",
       "description": "Tracks AI trends, competitor activity, market opportunities",
       "workdir": "~/agents/researcher",
-      "claudeProfile": "researcher",
+      "timeout": 300,
       "jobs": [
         {
           "name": "morning-scan",
           "schedule": "0 7 * * *",
           "mode": "continue",
           "prompt": "Morning research scan. Check HN, Reddit r/artificial, r/LocalLLaMA for overnight developments. Update findings.md.",
-          "telegram": true,
           "timeout": 300
         },
         {
@@ -23,7 +30,6 @@
           "schedule": "0 9 * * 1",
           "mode": "fresh",
           "prompt": "Write a weekly AI trends report based on this week's findings.md. Save to reports/week-of-$(date +%Y-%m-%d).md",
-          "telegram": true,
           "timeout": 600
         }
       ]
@@ -32,24 +38,22 @@
       "name": "developer",
       "description": "Works on code repos, implements features, fixes bugs",
       "workdir": "~/agents/developer",
-      "claudeProfile": "developer",
+      "allowedTools": "Edit,Write,Bash,Read",
+      "timeout": 3600,
       "jobs": [
         {
           "name": "overnight-coding",
           "schedule": "0 1 * * *",
           "mode": "continue",
           "prompt": "Check PRD.md for the next unfinished story. Implement it, write tests, commit to a feature branch. Update PRD.md with status.",
-          "telegram": true,
           "interactive": true,
-          "timeout": 3600,
-          "allowedTools": "Edit,Write,Bash,Read"
+          "timeout": 3600
         },
         {
           "name": "code-review",
           "schedule": "0 8 * * *",
           "mode": "fresh",
           "prompt": "Check for open PRs in the repo. Review each one. Post review notes to reviews/.",
-          "telegram": true,
           "timeout": 300
         }
       ]
@@ -58,14 +62,13 @@
       "name": "content",
       "description": "Creates social media posts, blog drafts, marketing content",
       "workdir": "~/agents/content",
-      "claudeProfile": "content",
+      "timeout": 300,
       "jobs": [
         {
           "name": "daily-posts",
           "schedule": "0 10 * * *",
           "mode": "continue",
           "prompt": "Review the content calendar in calendar.md. Draft today's scheduled posts. Save to drafts/ for review.",
-          "telegram": true,
           "timeout": 300
         },
         {
@@ -73,7 +76,6 @@
           "schedule": "0 2 * * 3",
           "mode": "fresh",
           "prompt": "Write a blog post based on the next topic in blog-ideas.md. Save draft to drafts/blog/.",
-          "telegram": true,
           "timeout": 900
         }
       ]
@@ -82,7 +84,7 @@
       "name": "ops",
       "description": "System health, backups, infrastructure monitoring",
       "workdir": "~/agents/ops",
-      "claudeProfile": "ops",
+      "timeout": 120,
       "jobs": [
         {
           "name": "heartbeat",
@@ -90,7 +92,6 @@
           "mode": "continue",
           "prompt": "Quick system check: disk space, memory, Docker containers, service health. If all good say HEARTBEAT_OK.",
           "suppressIfMatch": "HEARTBEAT_OK",
-          "telegram": true,
           "timeout": 60
         },
         {
@@ -98,7 +99,6 @@
           "schedule": "0 3 * * *",
           "mode": "fresh",
           "prompt": "Run nightly backup: dump databases, sync to cloud storage, verify backup integrity. Log results to logs/backup-$(date +%Y-%m-%d).md",
-          "telegram": true,
           "timeout": 600
         }
       ]
